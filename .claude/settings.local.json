@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python --version)",
+      "PowerShell(python -c \"import numpy, scipy, matplotlib; print\\('numpy', numpy.__version__\\); print\\('scipy', scipy.__version__\\); print\\('matplotlib', matplotlib.__version__\\)\")",
+      "Bash(MPLBACKEND=Agg python stpv_model.py)"
+    ]
+  }
+}
