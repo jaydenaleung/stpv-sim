@@ -89,6 +89,10 @@ SIGMA: float = 5.670374419e-8    # Stefan-Boltzmann constant [W m^-2 K^-4]
 
 ONE_SUN: float = 1000.0          # 1 sun = 1 kW/m^2 (per INSTRUCTIONS.md)
 THETA_SUN: float = np.deg2rad(0.2665)   # half-angle subtended by the sun
+# Thermodynamic (etendue) limit on solar concentration, C_max = 1/sin^2(th_sun)
+# ~ 46,200 suns.  A real optical train, single- or multi-stage, cannot exceed
+# this flux concentration; the model caps the geometric concentration here.
+C_MAX_THERMODYNAMIC: float = 1.0 / np.sin(THETA_SUN) ** 2
 
 T_MIN: float = 250.0             # lower search bound for equilibrium [K]
 T_MAX: float = 3500.0            # upper search bound [K] (W melts at 3695 K)
@@ -106,10 +110,12 @@ class EquilibriumError(RuntimeError):
 # 1b. CONCENTRATOR (OPTICAL FRONT-END) MODELS
 # ============================================================================
 # The concentrator collects sunlight over a large aperture and focuses it onto
-# the much smaller absorber.  Two options are supported: a Fresnel lens or a
-# parabolic dish.  For now these parameters are informational (printed to the
-# terminal); the estimated optical efficiency and collection area are not yet
-# coupled into the P_sol integral -- that wiring is a later step.
+# the much smaller absorber.  The primary stage is a Fresnel lens OR a parabolic
+# dish.  An OPTIONAL second stage -- a non-imaging compound parabolic
+# concentrator (CPC) -- can be added to boost concentration toward the
+# thermodynamic limit.  The primary's aperture/absorber area ratio sets the
+# geometric concentration N_s, the (product of the) stage optical efficiencies
+# scales P_sol, and the whole train is capped at C_MAX_THERMODYNAMIC.
 
 
 @dataclass(frozen=True)
@@ -189,40 +195,155 @@ class ParabolicDish:
 
 
 @dataclass(frozen=True)
-class Concentrator:
-    """Optical front-end selector: a Fresnel lens OR a parabolic dish.
+class CompoundParabolicConcentrator:
+    """Optional non-imaging second-stage concentrator (CPC).
 
-    `use_fresnel` is the y/n toggle: True selects the Fresnel lens, False the
-    parabolic dish.  Both option structs are stored so the choice can be
-    flipped without editing geometry.
+    A CPC placed at the primary's focus re-concentrates its focal spot onto the
+    absorber, boosting the flux toward the thermodynamic limit while adding some
+    reflection loss.  Sized by its entrance and exit aperture diameters; for a
+    circular (3-D) CPC the ideal concentration ratio is the area ratio of the
+    two apertures, C = (D_in / D_out)^2.
+
+    Attributes
+    ----------
+    entrance_diameter : float
+        Diameter of the CPC's entrance aperture [m] (faces the primary's focal
+        spot / receives the concentrated sunlight).
+    exit_diameter : float
+        Diameter of the CPC's exit aperture [m] (faces the absorber); must be
+        smaller than entrance_diameter to concentrate further.
+    efficiency : float
+        Optical throughput (0-1) of the CPC stage (mirror reflectance, etc.).
+    """
+    entrance_diameter: float
+    exit_diameter: float
+    efficiency: float
+    kind: str = field(default="Compound parabolic concentrator (2nd stage)",
+                      init=False)
+
+    @property
+    def exit_area(self) -> float:
+        """CPC exit aperture area = pi (D_out/2)^2 [m^2].
+
+        This is the true final "spot size" the primary's light is squeezed
+        into, so it -- not entrance_diameter or the absorber's own footprint --
+        is what sets the overall (primary + CPC) concentration once a CPC is
+        present.  See Concentrator.geometric_concentration.
+        """
+        return float(np.pi * (self.exit_diameter / 2.0) ** 2)
+
+    @property
+    def concentration_ratio(self) -> float:
+        """Ideal 3-D CPC concentration ratio C = (D_in / D_out)^2 (area ratio).
+
+        This is the CPC stage's OWN boost factor (informational / printed);
+        it is a diameter chain -- (D_primary/D_in)^2 * (D_in/D_out)^2 =
+        (D_primary/D_out)^2 -- so entrance_diameter cancels out of the overall
+        result and only exit_diameter (via exit_area) matters for the actual
+        geometric concentration.  See Concentrator.geometric_concentration.
+        """
+        return float((self.entrance_diameter / self.exit_diameter) ** 2)
+
+    def summary_lines(self) -> List[Tuple[str, str]]:
+        """(label, formatted value) pairs for terminal printing."""
+        return [
+            ("entrance diameter", f"{self.entrance_diameter * 100:.2f} cm"),
+            ("exit diameter", f"{self.exit_diameter * 100:.2f} cm"),
+            ("concentration ratio", f"{self.concentration_ratio:.1f} x"),
+            ("optical efficiency", f"{self.efficiency:.2f} "
+                                   f"({100 * self.efficiency:.0f} %)"),
+        ]
+
+
+@dataclass(frozen=True)
+class Concentrator:
+    """Optical front-end: a primary (Fresnel lens OR parabolic dish) and an
+    optional CPC second stage.
+
+    `use_fresnel` is the primary y/n toggle (True -> Fresnel lens, False ->
+    parabolic dish); both primary structs are stored so the choice can be
+    flipped without editing geometry.  `use_second_stage` toggles the CPC.
     """
     use_fresnel: bool
     fresnel: FresnelLens
     dish: ParabolicDish
+    use_second_stage: bool = False
+    second_stage: Optional[CompoundParabolicConcentrator] = None
 
     @property
     def active(self) -> "FresnelLens | ParabolicDish":
-        """The currently selected concentrator option."""
+        """The currently selected primary concentrator option."""
         return self.fresnel if self.use_fresnel else self.dish
 
+    @property
+    def _cpc(self) -> Optional[CompoundParabolicConcentrator]:
+        """The active CPC second stage, or None if not in use."""
+        return self.second_stage if self.use_second_stage else None
+
+    @property
+    def optical_efficiency(self) -> float:
+        """Combined optical throughput = primary x optional second stage."""
+        eff = self.active.efficiency
+        if self._cpc is not None:
+            eff *= self._cpc.efficiency
+        return eff
+
+    @property
+    def stage_concentration_factor(self) -> float:
+        """Extra concentration factor contributed by the second stage (1 if none).
+
+        Informational only (see geometric_concentration for what actually sets
+        N_s): the CPC's own entrance/exit area ratio.
+        """
+        return self._cpc.concentration_ratio if self._cpc is not None else 1.0
+
+    def geometric_concentration(self, absorber_area: float) -> float:
+        """Raw (uncapped) geometric solar concentration set by the optical train.
+
+        Without a CPC: primary aperture area / absorber face area -- the primary
+        is assumed to focus directly onto the absorber.
+
+        With a CPC: a diameter chain through both stages, (D_primary/D_in)^2 *
+        (D_in/D_out)^2 = D_primary_area / CPC_exit_area.  The CPC's exit
+        aperture becomes the effective final spot size, so entrance_diameter's
+        absolute value does not affect this result (only its ratio to
+        exit_diameter, via concentration_ratio, which cancels here) and
+        `absorber_area` is NOT used -- the absorber should be sized to receive
+        the CPC's exit spot instead.  (Coupling losses between the primary's
+        focal spot and the CPC's entrance are not modeled.)
+        """
+        if self._cpc is not None:
+            return self.active.collection_area / self._cpc.exit_area
+        return self.active.collection_area / absorber_area
+
     def print_summary(self) -> None:
-        """Print the selected concentrator's input parameters to the terminal."""
+        """Print the concentrator train's input parameters to the terminal."""
         active = self.active
         print(f"  concentrator : {active.kind} "
               f"(use_fresnel = {self.use_fresnel})")
         for label, value in active.summary_lines():
-            print(f"      {label:<20s}: {value}")
+            print(f"      {label:<22s}: {value}")
+        if self._cpc is not None:
+            print(f"      + 2nd stage           : {self._cpc.kind}")
+            for label, value in self._cpc.summary_lines():
+                print(f"      {label:<22s}: {value}")
+        else:
+            print(f"      {'2nd stage':<22s}: none")
 
 
 # ============================================================================
 # 1c. ABSORBER / EMITTER MATERIAL AND GEOMETRY
 # ============================================================================
 # The absorber (hot face toward the sun) and emitter (hot face toward the PV)
-# may be the same physical part.  Their radiative behaviour is captured either
-# by a named material (properties looked up in MATERIAL_LIBRARY) or by
-# directly-specified emissivity properties (MaterialProperties).  Tungsten can
-# additionally use the detailed transfer-matrix (TMM) model with thin-film AR
-# coatings.
+# may be the same physical part (same_part=True) or two distinct surfaces.  Each
+# surface's radiative behaviour is captured one of three ways:
+#   1. a named material, properties looked up in MATERIAL_LIBRARY (two-band);
+#   2. directly-specified MaterialProperties via custom_properties; or
+#   3. a detailed transfer-matrix (TMM) model, available for the materials in
+#      TMM_SUBSTRATE (tungsten and silicon carbide) when use_tmm=True.
+# When same_part=False the emitter can be given its OWN material / use_tmm /
+# custom_properties / length / width / depth via the emitter_* fields; any left
+# None fall back to the absorber's value.
 
 
 @dataclass(frozen=True)
@@ -264,6 +385,11 @@ MATERIAL_LIBRARY: Dict[str, MaterialProperties] = {
     "stainless steel": MaterialProperties("stainless steel", 0.40, 0.30, 2.0e-6),
 }
 
+#: Materials with a full TMM optical-constant model (see section 3), mapping the
+#: absorber/emitter material name -> REFRACTIVE_INDEX substrate key.  Only these
+#: may set use_tmm=True; other materials fall back to the two-band model.
+TMM_SUBSTRATE: Dict[str, str] = {"tungsten": "W", "silicon carbide": "SiC"}
+
 
 @dataclass(frozen=True)
 class AbsorberEmitter:
@@ -272,23 +398,25 @@ class AbsorberEmitter:
     Attributes
     ----------
     same_part : bool
-        If True, the absorber and emitter are the same piece/material, so the
-        emitter surface uses the absorber's emissivity model and (with equal
-        face areas) the nominal area ratio beta = 1.
+        If True, the absorber and emitter are the same piece/material: the
+        emitter reuses the absorber's emissivity model and geometry, and the
+        emitter_* fields below are ignored.
     material : str
-        Material name; used as a key into MATERIAL_LIBRARY (case-insensitive).
+        Absorber material name; key into MATERIAL_LIBRARY (case-insensitive).
     use_tmm : bool
-        If True and material == "tungsten" (and no custom_properties), use the
-        detailed TMM thin-film model instead of the two-band approximation.
+        If True and `material` is in TMM_SUBSTRATE (and no custom_properties),
+        use the detailed TMM model instead of the two-band approximation.
     custom_properties : MaterialProperties or None
-        Directly-specified radiative properties.  If provided, these override
-        the material lookup entirely (the "input the properties" path).
+        Directly-specified absorber radiative properties.  If provided, these
+        override the material lookup entirely (the "input the properties" path).
     length, width, depth : float
-        Rectangular-prism dimensions [m].  length x width is the absorber face
-        area (1-5 cm^2 per THEORY.md); depth is the thickness (0.1-1 cm).
-    emitter_length, emitter_width : float or None
-        Optional distinct emitter-face dimensions [m] when same_part is False;
-        default to the absorber face when None.
+        Absorber rectangular-prism dimensions [m].  length x width is the
+        absorber face area (1-5 cm^2 per THEORY.md); depth is the thickness.
+    emitter_material, emitter_use_tmm, emitter_custom_properties : optional
+        Distinct EMITTER material spec, used only when same_part is False.  Each
+        one left None falls back to the corresponding absorber value.
+    emitter_length, emitter_width, emitter_depth : float or None
+        Distinct emitter-face dimensions [m] (same_part False); None -> absorber.
     """
     same_part: bool = False
     material: str = "tungsten"
@@ -297,8 +425,13 @@ class AbsorberEmitter:
     length: float = 0.02
     width: float = 0.02
     depth: float = 0.005
+    # --- optional distinct emitter spec (used only when same_part is False) ---
+    emitter_material: Optional[str] = None
+    emitter_use_tmm: Optional[bool] = None
+    emitter_custom_properties: Optional[MaterialProperties] = None
     emitter_length: Optional[float] = None
     emitter_width: Optional[float] = None
+    emitter_depth: Optional[float] = None
 
     @property
     def absorber_area(self) -> float:
@@ -313,69 +446,108 @@ class AbsorberEmitter:
         return el * ew
 
     @property
+    def emitter_thickness(self) -> float:
+        """Emitter depth/thickness [m] (equals absorber depth unless overridden)."""
+        return self.depth if self.emitter_depth is None else self.emitter_depth
+
+    @property
     def nominal_beta(self) -> float:
         """Geometry-derived area ratio beta = A_emit / A_abs."""
         return self.emitter_area / self.absorber_area
 
-    def resolved_properties(self) -> Optional[MaterialProperties]:
-        """Return the effective MaterialProperties (custom or library lookup)."""
-        if self.custom_properties is not None:
-            return self.custom_properties
-        return MATERIAL_LIBRARY.get(self.material.lower())
+    def _emitter_spec(self) -> Tuple[str, bool, Optional[MaterialProperties]]:
+        """Resolve the emitter's (material, use_tmm, custom_properties).
+
+        Falls back to the absorber's values for any emitter_* left None; when
+        same_part is True the emitter is identical to the absorber.
+        """
+        if self.same_part:
+            return self.material, self.use_tmm, self.custom_properties
+        mat = self.material if self.emitter_material is None else self.emitter_material
+        use_tmm = (self.use_tmm if self.emitter_use_tmm is None
+                   else self.emitter_use_tmm)
+        custom = (self.custom_properties if self.emitter_custom_properties is None
+                  else self.emitter_custom_properties)
+        return mat, use_tmm, custom
+
+    @staticmethod
+    def _build_surface(material: str, use_tmm: bool,
+                       custom: Optional[MaterialProperties],
+                       role: str, shared: bool, verbose: bool) -> "Emissivity":
+        """Build one surface's emissivity model from its material spec.
+
+        custom_properties -> two-band model; else TMM if the material supports
+        it and use_tmm is set (tungsten gets role-specific AR coatings, other
+        TMM materials use a bare substrate); else the library two-band model.
+        """
+        if custom is not None:
+            return two_band_emissivity(custom, f"{custom.name} {role}")
+        key = TMM_SUBSTRATE.get(material.lower())
+        if use_tmm and key is not None:
+            if material.lower() == "tungsten" and not shared:
+                stack = (LayerStack("W + 80 nm HfO2 AR (selective absorber)",
+                                    (("HfO2", 80e-9),), "W") if role == "absorber"
+                         else LayerStack("W + 140 nm HfO2 (NIR-enhanced emitter)",
+                                         (("HfO2", 140e-9),), "W"))
+            else:
+                stack = LayerStack(f"bare {material} ({role}, TMM)", (), key)
+            return TMMEmissivity(stack, verbose=verbose)
+        props = MATERIAL_LIBRARY.get(material.lower())
+        if props is None:
+            raise ValueError(
+                f"Unknown absorber/emitter material '{material}'. Choose one of "
+                f"{sorted(MATERIAL_LIBRARY)} or supply custom_properties.")
+        return two_band_emissivity(props, f"{props.name} {role}")
 
     def build(self, verbose: bool = True) -> Tuple["Emissivity", "Emissivity"]:
         """Construct (absorber, emitter) emissivity models from this config.
 
-        Tungsten with use_tmm uses the detailed TMM stacks (bare W on both
-        faces when same_part, else a solar-optimized AR absorber and an
-        NIR-enhanced emitter).  All other cases use the two-band analytic model
-        built from the resolved MaterialProperties.
+        With same_part the two surfaces are the identical object; otherwise the
+        absorber is built from its own spec and the emitter from `_emitter_spec`.
         """
-        mat = self.material.lower()
-        if self.use_tmm and mat == "tungsten" and self.custom_properties is None:
-            if self.same_part:
-                shared = TMMEmissivity(LayerStack(
-                    "bare tungsten (absorber = emitter)", (), "W"),
-                    verbose=verbose)
-                return shared, shared
-            absorber = TMMEmissivity(LayerStack(
-                "W + 80 nm HfO2 AR (selective absorber)",
-                coatings=(("HfO2", 80e-9),), substrate="W"), verbose=verbose)
-            emitter = TMMEmissivity(LayerStack(
-                "W + 140 nm HfO2 (NIR-enhanced emitter)",
-                coatings=(("HfO2", 140e-9),), substrate="W"), verbose=verbose)
-            return absorber, emitter
-
-        props = self.resolved_properties()
-        if props is None:
-            raise ValueError(
-                f"Unknown absorber/emitter material '{self.material}'. "
-                f"Choose one of {sorted(MATERIAL_LIBRARY)} or supply "
-                f"custom_properties.")
-        absorber = two_band_emissivity(props, f"{props.name} absorber")
-        emitter = (absorber if self.same_part
-                   else two_band_emissivity(props, f"{props.name} emitter"))
+        if self.same_part:
+            shared = self._build_surface(self.material, self.use_tmm,
+                                         self.custom_properties, "absorber",
+                                         shared=True, verbose=verbose)
+            return shared, shared
+        absorber = self._build_surface(self.material, self.use_tmm,
+                                       self.custom_properties, "absorber",
+                                       shared=False, verbose=verbose)
+        e_mat, e_tmm, e_custom = self._emitter_spec()
+        emitter = self._build_surface(e_mat, e_tmm, e_custom, "emitter",
+                                      shared=False, verbose=verbose)
         return absorber, emitter
+
+    @staticmethod
+    def _describe_surface(material: str, use_tmm: bool,
+                          custom: Optional[MaterialProperties]) -> str:
+        """One-line description of a surface's radiative model for printing."""
+        if custom is not None:
+            return (f"custom '{custom.name}' (two-band eps "
+                    f"{custom.emissivity_short:g}/{custom.emissivity_long:g} @ "
+                    f"{custom.cutoff_wavelength * 1e6:.2g} um)")
+        model = "TMM" if (use_tmm and material.lower() in TMM_SUBSTRATE) \
+            else "two-band"
+        return f"'{material}' ({model} model)"
 
     def print_summary(self) -> None:
         """Print the absorber/emitter material and geometry to the terminal."""
-        props = self.resolved_properties()
-        src = ("custom properties" if self.custom_properties is not None
-               else f"library material '{self.material}'")
-        model = ("TMM thin-film" if (self.use_tmm and self.material.lower()
-                 == "tungsten" and self.custom_properties is None)
-                 else "two-band analytic")
-        print(f"  absorber/emitter : {src}, {model} model")
-        print(f"      same part            : {self.same_part}")
-        if props is not None and model != "TMM thin-film":
-            print(f"      emissivity (short)   : {props.emissivity_short:.2f} "
-                  f"(lambda <= {props.cutoff_wavelength * 1e6:.2g} um)")
-            print(f"      emissivity (long)    : {props.emissivity_long:.2f} "
-                  f"(lambda >  {props.cutoff_wavelength * 1e6:.2g} um)")
-        print(f"      length x width       : {self.length * 100:.2f} x "
-              f"{self.width * 100:.2f} cm  (A_abs = "
+        print(f"  absorber/emitter : same_part = {self.same_part}")
+        print(f"      absorber material    : "
+              f"{self._describe_surface(self.material, self.use_tmm, self.custom_properties)}")
+        if self.same_part:
+            print(f"      emitter material     : (same part as absorber)")
+        else:
+            print(f"      emitter material     : "
+                  f"{self._describe_surface(*self._emitter_spec())}")
+        print(f"      absorber L x W x D   : {self.length * 100:.2f} x "
+              f"{self.width * 100:.2f} x {self.depth * 100:.2f} cm  (A_abs = "
               f"{self.absorber_area * 1e4:.2f} cm^2)")
-        print(f"      depth (thickness)    : {self.depth * 100:.2f} cm")
+        el = self.length if self.emitter_length is None else self.emitter_length
+        ew = self.width if self.emitter_width is None else self.emitter_width
+        print(f"      emitter  L x W x D   : {el * 100:.2f} x {ew * 100:.2f} x "
+              f"{self.emitter_thickness * 100:.2f} cm  (A_emit = "
+              f"{self.emitter_area * 1e4:.2f} cm^2)")
         print(f"      nominal beta         : {self.nominal_beta:.3f} "
               f"(A_emit / A_abs)")
 
@@ -391,10 +563,9 @@ class DichroicFilter:
 
     A shortpass dichroic transmits above-bandgap (short-wavelength) photons to
     the cell and reflects sub-bandgap (long-wavelength) photons back to the
-    emitter, recycling that energy.  Modeled by a spectral transmittance
-    tau(lambda): the reflected fraction 1 - tau returns to the emitter and so
-    does not count as a net radiative loss, which raises T_eq and the spectral
-    efficiency.
+    emitter, recycling that energy.  The reflected fraction returns to the
+    emitter and so does not count as a net radiative loss, which raises T_eq
+    and the spectral efficiency.
 
     Attributes
     ----------
@@ -402,11 +573,13 @@ class DichroicFilter:
         y/n: whether the filter is present.
     cutoff_wavelength : float
         Shortpass edge [m]; lambda <= cutoff is transmitted (passband).
-    passband_transmittance : float
-        Transmittance tau for lambda <= cutoff (useful above-gap light).
-    stopband_transmittance : float
-        Transmittance tau for lambda > cutoff; the remainder is reflected back
-        to the emitter (photon recycling).
+    transmittance : float
+        Passband transmittance for lambda <= cutoff (useful above-gap light
+        sent to the cell).
+    reflectance : float
+        Stopband reflectance for lambda > cutoff (sub-bandgap light sent back
+        to the emitter for recycling); the remaining 1 - reflectance leaks
+        through to the cell as wasted sub-bandgap light.
     spacing : float
         Emitter-to-filter gap [m] (informational; would set a view factor).
     diameter, thickness : float
@@ -414,20 +587,25 @@ class DichroicFilter:
     """
     enabled: bool = False
     cutoff_wavelength: float = 1.2e-6
-    passband_transmittance: float = 0.95
-    stopband_transmittance: float = 0.05
+    transmittance: float = 0.95
+    reflectance: float = 0.95
     spacing: float = 0.005
     diameter: float = 0.03
     thickness: float = 0.002
 
-    def transmittance(self, lam: np.ndarray) -> np.ndarray:
-        """Spectral transmittance tau(lambda); all-ones when disabled."""
+    def spectral_transmittance(self, lam: np.ndarray) -> np.ndarray:
+        """Spectral transmittance tau(lambda); all-ones when disabled.
+
+        tau = `transmittance` for lambda <= cutoff (passband); tau =
+        1 - `reflectance` for lambda > cutoff (the stopband leakage; the
+        reflected `reflectance` fraction returns to the emitter instead).
+        """
         lam = np.asarray(lam, dtype=float)
         if not self.enabled:
             return np.ones_like(lam)
         return np.where(lam <= self.cutoff_wavelength,
-                        self.passband_transmittance,
-                        self.stopband_transmittance)
+                        self.transmittance,
+                        1.0 - self.reflectance)
 
     def print_summary(self) -> None:
         """Print the filter configuration to the terminal."""
@@ -436,10 +614,10 @@ class DichroicFilter:
             return
         print("  dichroic filter  : shortpass (enabled)")
         print(f"      cutoff wavelength    : {self.cutoff_wavelength * 1e6:.3f} um")
-        print(f"      passband tau         : {self.passband_transmittance:.2f} "
+        print(f"      transmittance        : {self.transmittance:.2f} "
               f"(lambda <= cutoff, to cell)")
-        print(f"      stopband tau         : {self.stopband_transmittance:.2f} "
-              f"(lambda >  cutoff; rest recycled)")
+        print(f"      reflectance          : {self.reflectance:.2f} "
+              f"(lambda >  cutoff; recycled to emitter)")
         print(f"      emitter-filter gap   : {self.spacing * 1e3:.2f} mm")
         print(f"      diameter x thickness : {self.diameter * 1e3:.1f} x "
               f"{self.thickness * 1e3:.2f} mm")
@@ -553,9 +731,28 @@ class PVCell:
 # ============================================================================
 # 1f. RADIATIVE VIEW FACTORS (emitter -> filter -> cell geometry)
 # ============================================================================
-# Finite parallel surfaces separated by a gap intercept only a fraction of each
-# other's radiation; the rest spills to the surroundings.  That fraction is the
-# view factor, and it sets the geometric part of the cavity efficiency CE.
+# HOW THE VIEW FACTOR WORKS
+# -------------------------
+# The emitter, (optional) filter, and PV cell are small stacked surfaces
+# separated by air gaps.  Radiation leaving the emitter spreads into a
+# hemisphere, so only a fraction actually lands on the next surface; the rest
+# "spills" past the edges into the surroundings and is lost.  That intercepted
+# fraction is the radiative VIEW FACTOR F (0-1), a purely geometric quantity set
+# by the surface sizes and the gap between them:
+#   - large faces, small gap  -> F near 1 (almost nothing spills);
+#   - small faces, large gap  -> F near 0 (most radiation misses the target).
+#
+# We use the exact closed-form view factor for two coaxial parallel DISKS
+# (view_factor_coaxial_disks).  The square emitter/cell faces are represented by
+# equal-area disks (r = sqrt(A/pi)); the filter is already a disk.  With a
+# filter present the emitter->cell transfer is a two-hop chain,
+# F = F(emitter->filter) * F(filter->cell), each hop over its own spacing;
+# without a filter it is the single emitter->cell hop over the cell standoff.
+#
+# The result multiplies the cell's intrinsic cavity efficiency to give the
+# effective CE (STPVSystem.effective_cavity_eff), so wider gaps directly lower
+# CE, the photocurrent, and eta_pvc.  It does NOT change the emitter's radiative
+# loss (spilled light still leaves the emitter), so T_eq is unaffected.
 
 
 def view_factor_coaxial_disks(r1: float, r2: float, gap: float) -> float:
@@ -626,46 +823,79 @@ def system_view_factor(absorber_emitter: "AbsorberEmitter",
 # instead, set NS_OVERRIDE to a number of suns; leave it None to use geometry.
 NS_OVERRIDE: Optional[float] = None
 
-# --- 1. Concentrator: pick a Fresnel lens or a parabolic dish -----------------
+# --- 1. Concentrator: primary (Fresnel lens or dish) + optional CPC 2nd stage -
+# use_fresnel picks the primary.  use_second_stage adds a compound parabolic
+# concentrator (CPC), sized by its entrance/exit diameters.  WITHOUT a CPC, the
+# geometric concentration is (primary aperture area / absorber face area) --
+# the primary is assumed to focus directly onto the absorber.  WITH a CPC, it
+# instead becomes (primary aperture area / CPC exit area): a diameter chain
+# through both stages where entrance_diameter cancels out algebraically, so
+# only exit_diameter (the true final spot size) and the primary's own aperture
+# matter -- ABSORBER_EMITTER's size is then NOT used for concentration, so size
+# the absorber to receive the CPC's exit spot.  Optical efficiency is always
+# primary_efficiency x CPC_efficiency.  The total is capped at the
+# thermodynamic limit C_MAX_THERMODYNAMIC.
 CONCENTRATOR: Concentrator = Concentrator(
     use_fresnel=False,                    # y/n toggle: True -> Fresnel lens
     fresnel=FresnelLens(
         focal_length=0.30, width=0.30, length=0.30, efficiency=0.85),
     dish=ParabolicDish(
-        focal_length=0.60, diameter=1.50, depth=0.234, efficiency=0.25),
+        focal_length=0.377, diameter=0.3, depth=0.0149, efficiency=0.25),
+    use_second_stage=True,               # y/n toggle: add a CPC second stage
+    second_stage=CompoundParabolicConcentrator(
+        entrance_diameter=0.0107, exit_diameter=0.005, efficiency=0.80),
 )
 
 # --- 2. Absorber / emitter: material + geometry -------------------------------
 # material: one of MATERIAL_LIBRARY ("tungsten", "tantalum", "graphite",
-# "silicon carbide", "stainless steel"), or set custom_properties to input the
-# emissivity properties directly.  use_tmm=True gives tungsten the detailed
-# thin-film model; same_part=True makes the emitter identical to the absorber.
+#   "silicon carbide", "stainless steel").
+# use_tmm=True uses the detailed TMM model (only for materials in TMM_SUBSTRATE:
+#   tungsten and silicon carbide); otherwise the two-band model is used.
+# custom_properties: leave None to use the named material, OR supply your own
+#   MaterialProperties to define the surface directly, which OVERRIDES `material`
+#   and `use_tmm`.  Signature:
+#       MaterialProperties(name, emissivity_short, emissivity_long, cutoff_wavelength_m)
+#   e.g. MaterialProperties("myMat", 0.90, 0.20, 2.0e-6)  ->  eps=0.90 for
+#   lambda <= 2 um and eps=0.20 for longer wavelengths.
+#
+# same_part=True: the emitter is the SAME piece as the absorber (identical
+#   material and geometry); the emitter_* fields below are ignored.
+# same_part=False: the emitter is a distinct surface.  Give it its own optics
+#   and size with emitter_material / emitter_use_tmm / emitter_custom_properties
+#   / emitter_length / emitter_width / emitter_depth.  Any left None fall back to
+#   the absorber's value, and the emitter/absorber face areas set the nominal
+#   area ratio beta = A_emit / A_abs.
 ABSORBER_EMITTER: AbsorberEmitter = AbsorberEmitter(
     same_part=True,
     material="silicon carbide",
-    use_tmm=False,
-    custom_properties=None,              # e.g. MaterialProperties("myMat", 0.9, 0.2, 2e-6)
-    length=0.02, width=0.02, depth=0.003,
+    use_tmm=True,
+    custom_properties=None,
+    length=0.01, width=0.01, depth=0.003175,
+    # Distinct emitter spec (used only when same_part=False; None -> use absorber's):
+    emitter_material=None,
+    emitter_use_tmm=None,
+    emitter_custom_properties=None,
+    emitter_length=None, emitter_width=None, emitter_depth=None,
 )
 
 # --- 3. Optional dichroic shortpass filter (cold-side photon recycling) -------
 DICHROIC_FILTER: DichroicFilter = DichroicFilter(
     enabled=False,                       # y/n toggle
     cutoff_wavelength=1.10e-6,           # ~Si bandgap edge
-    passband_transmittance=0.95,
-    stopband_transmittance=0.05,
-    spacing=0.005, diameter=0.03, thickness=0.002,
+    transmittance=0.85,                  # passband (lambda <= cutoff), to cell
+    reflectance=0.97,                    # stopband (lambda >  cutoff), recycled
+    spacing=0.005, diameter=0.0356, thickness=0.00105,
 )
 
 # --- 4. PV cell (silicon) + heatsink ------------------------------------------
 # Provide rated_voc and rated_jsc together to drive VF from datasheet specs,
 # or leave them None to use dark_current directly.
 PV_CELL: PVCell = PVCell(
-    bandgap_ev=1.12, iqe=0.95, fill_factor=0.80, cavity_eff=0.95,
-    cell_temp=300.0, dark_current=1.0e-8,
-    length=0.02, width=0.02, depth=0.0003,
-    filter_spacing=0.005,
-    rated_voc=None, rated_jsc=None, rated_efficiency=0.22,
+    bandgap_ev=1.12, iqe=0.97, fill_factor=0.759, cavity_eff=0.95,
+    cell_temp=298.15, dark_current=8.97e-10,
+    length=0.023, width=0.008, depth=0.0018,
+    filter_spacing=0.0032,
+    rated_voc=0.69, rated_jsc=0.0586, rated_efficiency=0.25,
     heatsink=True,
 )
 
@@ -677,11 +907,18 @@ PV_CELL: PVCell = PVCell(
 USE_VIEW_FACTOR_CE: bool = True
 
 # --- Derived N_s --------------------------------------------------------------
-# Geometric concentration = concentrator aperture area / absorber face area.
-# This is the raw optical concentration set purely by the two sizes; the
-# concentrator's optical efficiency is applied separately (it scales P_sol).
-GEOMETRIC_CONCENTRATION: float = (
-    CONCENTRATOR.active.collection_area / ABSORBER_EMITTER.absorber_area)
+# Geometric concentration, capped at the thermodynamic limit.  This is the raw
+# flux concentration set purely by geometry; the optical efficiency of each
+# stage is applied separately (it scales P_sol).
+#   - No CPC (use_second_stage=False): primary aperture area / absorber face
+#     area -- the primary is assumed to focus directly onto the absorber.
+#   - With CPC (use_second_stage=True): primary aperture area / CPC exit area
+#     (a diameter chain through both stages) -- the CPC's exit aperture is the
+#     effective final spot size, so ABSORBER_EMITTER.absorber_area is NOT used
+#     here; size the absorber to receive the CPC's exit spot instead.
+GEOMETRIC_CONCENTRATION: float = min(
+    CONCENTRATOR.geometric_concentration(ABSORBER_EMITTER.absorber_area),
+    C_MAX_THERMODYNAMIC)
 NS_DEFAULT: float = (float(NS_OVERRIDE) if NS_OVERRIDE is not None
                      else GEOMETRIC_CONCENTRATION)
 SYSTEM_VIEW_FACTOR: float = (
@@ -814,6 +1051,46 @@ def refractive_index_tungsten(lam: np.ndarray) -> np.ndarray:
     return np.sqrt(eps)
 
 
+# Single-oscillator (Lorentz) reststrahlen model for 6H silicon carbide,
+# Spitzer, Kleinman & Walsh, Phys. Rev. 113, 127 (1959).  Wavenumbers in cm^-1:
+# high-frequency permittivity, transverse- and longitudinal-optical phonon
+# frequencies, and phonon damping.  This yields SiC's strong mid-IR reststrahlen
+# band (~10.3-12.6 um), where it is highly reflective/opaque, and a nearly
+# transparent, weakly-absorbing near-IR/visible window.
+_SIC_EPS_INF: float = 6.7
+_SIC_WTO: float = 797.0
+_SIC_WLO: float = 973.0
+_SIC_GAMMA: float = 4.76
+
+
+def refractive_index_sic(lam: np.ndarray) -> np.ndarray:
+    """Complex refractive index n + ik of 6H-SiC (Lorentz reststrahlen model).
+
+    Parameters
+    ----------
+    lam : np.ndarray
+        Vacuum wavelength [m].
+
+    Returns
+    -------
+    np.ndarray
+        Complex refractive index (Im >= 0, passive medium).
+
+    Notes
+    -----
+    eps(nu) = eps_inf (nu_LO^2 - nu^2 - i*gamma*nu) / (nu_TO^2 - nu^2 - i*gamma*nu)
+    with nu the vacuum wavenumber in cm^-1.  Loss (k) is significant only in the
+    reststrahlen band, so the opaque Kirchhoff assumption eps_emis = 1 - R used
+    by TMMEmissivity is rigorous there and overestimates emittance in SiC's
+    transparent near-IR window (a bulk emitter would be backed by an opaque
+    layer); adequate for a first-order refractory-emitter model.
+    """
+    nu = 1.0e-2 / np.asarray(lam, dtype=float)   # vacuum wavenumber [cm^-1]
+    eps = _SIC_EPS_INF * ((_SIC_WLO**2 - nu**2 - 1j * _SIC_GAMMA * nu)
+                          / (_SIC_WTO**2 - nu**2 - 1j * _SIC_GAMMA * nu))
+    return np.sqrt(eps.astype(complex))
+
+
 def _constant_index(n: float) -> Callable[[np.ndarray], np.ndarray]:
     """Return a dispersion-free refractive-index function n(lam) = n + 0i."""
     def index(lam: np.ndarray) -> np.ndarray:
@@ -825,6 +1102,7 @@ def _constant_index(n: float) -> Callable[[np.ndarray], np.ndarray]:
 REFRACTIVE_INDEX: Dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "Air": _constant_index(1.00),
     "W": refractive_index_tungsten,
+    "SiC": refractive_index_sic,
     "HfO2": _constant_index(1.90),
     "SiO2": _constant_index(1.45),
 }
@@ -1042,6 +1320,19 @@ class STPVSystem:
         """Effective cavity efficiency CE = intrinsic cavity_eff x view_factor."""
         return self.cell.cavity_eff * self.view_factor
 
+    @property
+    def effective_concentration(self) -> float:
+        """Effective delivered concentration N_s,eff = N_s x concentrator_efficiency.
+
+        `concentration` (N_s) is the raw geometric concentration incident on the
+        concentrator; concentrator_efficiency already derates P_sol for optical
+        losses in that same calculation.  N_s,eff is just that same derating
+        applied to N_s itself, so it is the right quantity to *display* as "how
+        many suns' worth of power actually reaches the absorber" -- it does not
+        change P_sol, which already includes the efficiency factor directly.
+        """
+        return self.concentration * self.concentrator_efficiency
+
     def __post_init__(self) -> None:
         lam = LAM_GRID
         if self.theta_c is not None:
@@ -1056,7 +1347,7 @@ class STPVSystem:
         # Cold-side filter transmittance (all ones if no/disabled filter); the
         # emitter's effective emissivity toward the cell is weighted by it.
         self._filter_tau: np.ndarray = (
-            self.optical_filter.transmittance(lam)
+            self.optical_filter.spectral_transmittance(lam)
             if self.optical_filter is not None else np.ones_like(lam))
         self._eps_emit_cold: np.ndarray = self._eps_emit_hemi * self._filter_tau
         eps_abs_cone = self.absorber.cone_average(lam, self.theta_c_eff)
@@ -1258,15 +1549,25 @@ class Sweeper:
                 label=f"Equilibrium: $T_{{eq}}$ = {t_eq:.0f} K")
         ax.set_xlabel("Module temperature $T$ [K]")
         ax.set_ylabel(r"Power density [kW/m$^2$ of absorber]")
-        ax.set_title(f"Thermal equilibrium ($N_s$ = {self.base.concentration:g} "
-                     f"suns, $\\beta$ = {self.base.beta:g})")
+        ax.set_title(r"Thermal equilibrium ($N_{s,eff}$ = "
+                     f"{self.base.effective_concentration:,.0f} suns, "
+                     f"$\\beta$ = {self.base.beta:g})")
         ax.legend(loc="best")
         return self._finish(fig, "fig1_thermal_equilibrium.png")
 
     # ------------------------------------------------- 2. concentration sweep
     def plot_concentration_sweep(self) -> plt.Figure:
-        """N_s from 1 to 10,000 suns vs T_eq and eta_STPV."""
+        """N_s,eff from 1 to 10,000 delivered suns vs T_eq and eta_STPV.
+
+        The sweep drives the underlying raw N_s (system.concentration, which is
+        what solve_equilibrium/p_sol actually use); concentrator_efficiency is
+        held fixed at the base system's value throughout.  The x-axis instead
+        displays N_s,eff = N_s x concentrator_efficiency -- the delivered suns
+        actually reaching the absorber -- since that is the physically
+        meaningful quantity to compare across different concentrator designs.
+        """
         ns_vals = np.geomspace(1.0, 1.0e4, 49)
+        ns_eff_vals = ns_vals * self.base.concentrator_efficiency
         t_eq = np.full_like(ns_vals, np.nan)
         eta = np.full_like(ns_vals, np.nan)
         for i, ns in enumerate(ns_vals):
@@ -1282,14 +1583,14 @@ class Sweeper:
 
         fig, ax1 = plt.subplots()
         ax2 = ax1.twinx()
-        l1, = ax1.semilogx(ns_vals, 100.0 * eta, color="tab:blue",
+        l1, = ax1.semilogx(ns_eff_vals, 100.0 * eta, color="tab:blue",
                            label=r"$\eta_{STPV}$")
-        l2, = ax2.semilogx(ns_vals, t_eq, color="tab:red",
+        l2, = ax2.semilogx(ns_eff_vals, t_eq, color="tab:red",
                            label=r"$T_{eq}$")
         ax2.axhline(T_MELT_W, color="tab:red", ls=":", lw=1.2)
-        ax2.text(ns_vals[-1], T_MELT_W - 110, "tungsten melting point",
+        ax2.text(ns_eff_vals[-1], T_MELT_W - 110, "tungsten melting point",
                  color="tab:red", fontsize=9, ha="right")
-        ax1.set_xlabel(r"Solar concentration $N_s$ [suns]")
+        ax1.set_xlabel(r"Effective delivered concentration $N_{s,eff}$ [suns]")
         ax1.set_ylabel(r"Overall efficiency $\eta_{STPV}$ [%]",
                        color="tab:blue")
         ax2.set_ylabel(r"Equilibrium temperature $T_{eq}$ [K]",
@@ -1297,8 +1598,10 @@ class Sweeper:
         ax1.tick_params(axis="y", labelcolor="tab:blue")
         ax2.tick_params(axis="y", labelcolor="tab:red")
         ax2.grid(False)
-        ax1.set_title(r"Concentration sweep: $\eta_{STPV}$ and $T_{eq}$ vs $N_s$"
-                      f" ($\\beta$ = {self.base.beta:g})")
+        ax1.set_title(r"Concentration sweep: $\eta_{STPV}$ and $T_{eq}$ vs "
+                      r"$N_{s,eff}$"
+                      f" ($\\beta$ = {self.base.beta:g}, concentrator eff = "
+                      f"{self.base.concentrator_efficiency:.2f})")
         ax1.legend(handles=[l1, l2], loc="upper left")
         return self._finish(fig, "fig2_concentration_sweep.png")
 
@@ -1334,7 +1637,8 @@ class Sweeper:
         ax2.tick_params(axis="y", labelcolor="tab:red")
         ax2.grid(False)
         ax1.set_title(r"Area-ratio sweep: $\eta_{STPV}$ vs $\beta$"
-                      f" ($N_s$ = {self.base.concentration:g} suns)")
+                      r" ($N_{s,eff}$ = "
+                      f"{self.base.effective_concentration:,.0f} suns)")
         ax1.legend(handles=[l1, l2, l3], loc="best")
         return self._finish(fig, "fig3_area_ratio_sweep.png")
 
@@ -1414,7 +1718,8 @@ class Sweeper:
         ax.set_xlabel(r"PV bandgap $V_g$ [eV]")
         ax.set_ylabel(r"Overall efficiency $\eta_{STPV}$ [%]")
         ax.set_title(r"Bandgap sweep: blackbody vs narrowband emitter"
-                     f" ($N_s$ = {self.base.concentration:g} suns, "
+                     r" ($N_{s,eff}$ = "
+                     f"{self.base.effective_concentration:,.0f} suns, "
                      f"$\\beta$ = {self.base.beta:g})")
         ax.legend(loc="best")
         return self._finish(fig, "fig5_bandgap_sweep.png")
@@ -1500,7 +1805,7 @@ def build_default_system(verbose: bool = True) -> STPVSystem:
     return STPVSystem(
         absorber=absorber, emitter=emitter,
         concentration=NS_DEFAULT, beta=ABSORBER_EMITTER.nominal_beta,
-        cell=PV_CELL, concentrator_efficiency=CONCENTRATOR.active.efficiency,
+        cell=PV_CELL, concentrator_efficiency=CONCENTRATOR.optical_efficiency,
         optical_filter=DICHROIC_FILTER, view_factor=SYSTEM_VIEW_FACTOR)
 
 
@@ -1520,10 +1825,12 @@ def main() -> None:
     print("\nSystem configuration")
     print("-" * 72)
     CONCENTRATOR.print_summary()
-    active = CONCENTRATOR.active
-    print(f"      geometric conc.      : {GEOMETRIC_CONCENTRATION:,.0f} suns "
-          f"(A_aper / A_abs); x eff -> "
-          f"{GEOMETRIC_CONCENTRATION * active.efficiency:,.0f} suns delivered")
+    conc_formula = ("A_aper / A_CPC,exit (diameter chain)"
+                    if CONCENTRATOR.use_second_stage else "A_aper / A_abs")
+    print(f"      geometric conc.       : {GEOMETRIC_CONCENTRATION:,.0f} suns "
+          f"({conc_formula}); x eff -> "
+          f"{GEOMETRIC_CONCENTRATION * CONCENTRATOR.optical_efficiency:,.0f} "
+          f"suns delivered")
     ABSORBER_EMITTER.print_summary()
     print(f"      absorber surface     : {system.absorber.name}")
     print(f"      emitter surface      : {system.emitter.name}")
