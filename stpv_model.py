@@ -198,11 +198,19 @@ class ParabolicDish:
 class CompoundParabolicConcentrator:
     """Optional non-imaging second-stage concentrator (CPC).
 
-    A CPC placed at the primary's focus re-concentrates its focal spot onto the
-    absorber, boosting the flux toward the thermodynamic limit while adding some
-    reflection loss.  Sized by its entrance and exit aperture diameters; for a
-    circular (3-D) CPC the ideal concentration ratio is the area ratio of the
-    two apertures, C = (D_in / D_out)^2.
+    A CPC placed at the primary's focus re-concentrates its focal spot onto a
+    smaller exit spot, at the cost of some reflection loss.  It redistributes
+    the SAME power the primary already collected onto a smaller area -- it
+    cannot create additional power -- so it does not, by itself, increase the
+    power delivered to a fixed-size absorber (see Concentrator.geometric_
+    concentration for why).  Its real benefit is enabling a smaller, cheaper
+    absorber/receiver: shrink the absorber to match exit_diameter and the same
+    total collected power is now averaged over a smaller area, i.e. a genuinely
+    higher concentration in suns/m^2.
+
+    Sized by its entrance and exit aperture diameters; for a circular (3-D) CPC
+    the ideal internal concentration ratio is the area ratio of the two
+    apertures, C = (D_in / D_out)^2 (informational -- see concentration_ratio).
 
     Attributes
     ----------
@@ -225,10 +233,10 @@ class CompoundParabolicConcentrator:
     def exit_area(self) -> float:
         """CPC exit aperture area = pi (D_out/2)^2 [m^2].
 
-        This is the true final "spot size" the primary's light is squeezed
-        into, so it -- not entrance_diameter or the absorber's own footprint --
-        is what sets the overall (primary + CPC) concentration once a CPC is
-        present.  See Concentrator.geometric_concentration.
+        The final "spot size" the primary's light is squeezed into.  For the
+        model to be energy-consistent, the absorber should be sized to match
+        this (see Concentrator.geometric_concentration and the mismatch check
+        in main()); it is not otherwise used to compute concentration.
         """
         return float(np.pi * (self.exit_diameter / 2.0) ** 2)
 
@@ -236,11 +244,14 @@ class CompoundParabolicConcentrator:
     def concentration_ratio(self) -> float:
         """Ideal 3-D CPC concentration ratio C = (D_in / D_out)^2 (area ratio).
 
-        This is the CPC stage's OWN boost factor (informational / printed);
-        it is a diameter chain -- (D_primary/D_in)^2 * (D_in/D_out)^2 =
-        (D_primary/D_out)^2 -- so entrance_diameter cancels out of the overall
-        result and only exit_diameter (via exit_area) matters for the actual
-        geometric concentration.  See Concentrator.geometric_concentration.
+        This is the CPC stage's OWN internal boost -- how much smaller its
+        exit spot is than its entrance spot -- shown for reference only.  It
+        does NOT multiply into the system's overall geometric concentration:
+        that quantity is fixed by (primary aperture area / absorber area)
+        regardless of what optics sit in between, since total collected power
+        is unchanged and the absorber area (the reference over which that
+        power is averaged) is unchanged.  A CPC only pays off in more suns/m^2
+        if you also shrink the absorber to match its exit spot.
         """
         return float((self.entrance_diameter / self.exit_diameter) ** 2)
 
@@ -249,7 +260,8 @@ class CompoundParabolicConcentrator:
         return [
             ("entrance diameter", f"{self.entrance_diameter * 100:.2f} cm"),
             ("exit diameter", f"{self.exit_diameter * 100:.2f} cm"),
-            ("concentration ratio", f"{self.concentration_ratio:.1f} x"),
+            ("internal boost ratio", f"{self.concentration_ratio:.1f} x "
+                                     f"((D_in/D_out)^2, informational)"),
             ("optical efficiency", f"{self.efficiency:.2f} "
                                    f"({100 * self.efficiency:.0f} %)"),
         ]
@@ -290,30 +302,33 @@ class Concentrator:
 
     @property
     def stage_concentration_factor(self) -> float:
-        """Extra concentration factor contributed by the second stage (1 if none).
+        """The CPC's own internal entrance/exit area ratio (1 if no CPC).
 
-        Informational only (see geometric_concentration for what actually sets
-        N_s): the CPC's own entrance/exit area ratio.
+        Informational only -- see geometric_concentration for why this does
+        NOT multiply into the system's overall concentration.
         """
         return self._cpc.concentration_ratio if self._cpc is not None else 1.0
 
     def geometric_concentration(self, absorber_area: float) -> float:
-        """Raw (uncapped) geometric solar concentration set by the optical train.
+        """Raw (uncapped) geometric solar concentration = primary aperture area
+        / absorber face area.
 
-        Without a CPC: primary aperture area / absorber face area -- the primary
-        is assumed to focus directly onto the absorber.
+        This is total collected power (proportional to the primary's aperture
+        area) divided by the absorber's FIXED face area -- the correct average
+        flux for an isothermal absorber, in "suns" (multiples of 1 kW/m^2).
 
-        With a CPC: a diameter chain through both stages, (D_primary/D_in)^2 *
-        (D_in/D_out)^2 = D_primary_area / CPC_exit_area.  The CPC's exit
-        aperture becomes the effective final spot size, so entrance_diameter's
-        absolute value does not affect this result (only its ratio to
-        exit_diameter, via concentration_ratio, which cancels here) and
-        `absorber_area` is NOT used -- the absorber should be sized to receive
-        the CPC's exit spot instead.  (Coupling losses between the primary's
-        focal spot and the CPC's entrance are not modeled.)
+        A CPC second stage redistributes that SAME collected power onto a
+        smaller spot; it cannot manufacture additional power, so as long as
+        the absorber's face area is unchanged, adding a CPC does NOT change
+        this ratio -- it only adds its own optical efficiency (extra
+        reflection losses) via `optical_efficiency`.  To get a genuinely
+        higher concentration (more suns per m^2), shrink `absorber_area` to
+        match the CPC's exit spot (CompoundParabolicConcentrator.exit_area);
+        the formula then naturally reflects the higher average flux over that
+        smaller absorber.  (This ignores spillage of light that misses the
+        absorber footprint, and any focal-spot-size mismatch between the
+        primary and the CPC's entrance -- neither is modeled.)
         """
-        if self._cpc is not None:
-            return self.active.collection_area / self._cpc.exit_area
         return self.active.collection_area / absorber_area
 
     def print_summary(self) -> None:
@@ -383,6 +398,7 @@ MATERIAL_LIBRARY: Dict[str, MaterialProperties] = {
     "graphite":        MaterialProperties("graphite",        0.85, 0.85, 2.0e-6),
     "silicon carbide": MaterialProperties("silicon carbide", 0.90, 0.88, 2.0e-6),
     "stainless steel": MaterialProperties("stainless steel", 0.40, 0.30, 2.0e-6),
+    "aluminum":        MaterialProperties("aluminum",        0.15, 0.03, 2.0e-6),
 }
 
 #: Materials with a full TMM optical-constant model (see section 3), mapping the
@@ -825,15 +841,16 @@ NS_OVERRIDE: Optional[float] = None
 
 # --- 1. Concentrator: primary (Fresnel lens or dish) + optional CPC 2nd stage -
 # use_fresnel picks the primary.  use_second_stage adds a compound parabolic
-# concentrator (CPC), sized by its entrance/exit diameters.  WITHOUT a CPC, the
-# geometric concentration is (primary aperture area / absorber face area) --
-# the primary is assumed to focus directly onto the absorber.  WITH a CPC, it
-# instead becomes (primary aperture area / CPC exit area): a diameter chain
-# through both stages where entrance_diameter cancels out algebraically, so
-# only exit_diameter (the true final spot size) and the primary's own aperture
-# matter -- ABSORBER_EMITTER's size is then NOT used for concentration, so size
-# the absorber to receive the CPC's exit spot.  Optical efficiency is always
-# primary_efficiency x CPC_efficiency.  The total is capped at the
+# concentrator (CPC), sized by its entrance/exit diameters.  The geometric
+# concentration is ALWAYS (primary aperture area / absorber face area): total
+# collected power divided by the absorber's fixed face area.  A CPC
+# redistributes that SAME power onto a smaller spot but cannot create more of
+# it, so simply enabling one does NOT increase this ratio -- it only adds its
+# own optical efficiency (extra reflection losses) to the combined
+# primary_efficiency x CPC_efficiency.  To get an actually higher concentration
+# with a CPC, shrink ABSORBER_EMITTER's length/width to match the CPC's exit
+# spot (pi*(exit_diameter/2)^2) -- the smaller absorber then legitimately
+# raises (aperture area / absorber area).  The result is capped at the
 # thermodynamic limit C_MAX_THERMODYNAMIC.
 CONCENTRATOR: Concentrator = Concentrator(
     use_fresnel=False,                    # y/n toggle: True -> Fresnel lens
@@ -907,15 +924,12 @@ PV_CELL: PVCell = PVCell(
 USE_VIEW_FACTOR_CE: bool = True
 
 # --- Derived N_s --------------------------------------------------------------
-# Geometric concentration, capped at the thermodynamic limit.  This is the raw
-# flux concentration set purely by geometry; the optical efficiency of each
-# stage is applied separately (it scales P_sol).
-#   - No CPC (use_second_stage=False): primary aperture area / absorber face
-#     area -- the primary is assumed to focus directly onto the absorber.
-#   - With CPC (use_second_stage=True): primary aperture area / CPC exit area
-#     (a diameter chain through both stages) -- the CPC's exit aperture is the
-#     effective final spot size, so ABSORBER_EMITTER.absorber_area is NOT used
-#     here; size the absorber to receive the CPC's exit spot instead.
+# Geometric concentration = primary aperture area / absorber face area, capped
+# at the thermodynamic limit.  This is total collected power averaged over the
+# absorber's fixed footprint; it is the same whether or not a CPC is enabled,
+# since the CPC only redistributes that power onto a smaller spot rather than
+# adding to it (see Concentrator.geometric_concentration).  The optical
+# efficiency of each stage is applied separately (it scales P_sol).
 GEOMETRIC_CONCENTRATION: float = min(
     CONCENTRATOR.geometric_concentration(ABSORBER_EMITTER.absorber_area),
     C_MAX_THERMODYNAMIC)
@@ -1825,12 +1839,28 @@ def main() -> None:
     print("\nSystem configuration")
     print("-" * 72)
     CONCENTRATOR.print_summary()
-    conc_formula = ("A_aper / A_CPC,exit (diameter chain)"
-                    if CONCENTRATOR.use_second_stage else "A_aper / A_abs")
     print(f"      geometric conc.       : {GEOMETRIC_CONCENTRATION:,.0f} suns "
-          f"({conc_formula}); x eff -> "
+          f"(A_aper / A_abs); x eff -> "
           f"{GEOMETRIC_CONCENTRATION * CONCENTRATOR.optical_efficiency:,.0f} "
           f"suns delivered")
+    if CONCENTRATOR.use_second_stage:
+        exit_area = CONCENTRATOR.second_stage.exit_area
+        abs_area = ABSORBER_EMITTER.absorber_area
+        ratio = exit_area / abs_area
+        print(f"      CPC exit vs absorber  : exit spot = "
+              f"{exit_area * 1e4:.3f} cm^2 vs absorber = {abs_area * 1e4:.3f} "
+              f"cm^2 ({ratio:.2f}x)")
+        if ratio < 0.9:
+            print(f"        note: CPC exit spot is smaller than the absorber -- "
+                  f"the CPC adds only its {CONCENTRATOR.second_stage.efficiency:.2f} "
+                  f"efficiency factor here, no concentration boost; shrink the "
+                  f"absorber to ~{exit_area * 1e4:.3f} cm^2 to realize the CPC's "
+                  f"{CONCENTRATOR.second_stage.concentration_ratio:.1f}x internal "
+                  f"boost as real concentration.")
+        elif ratio > 1.1:
+            print(f"        note: CPC exit spot is larger than the absorber -- "
+                  f"some concentrated light would spill past the absorber "
+                  f"(not modeled as a loss here).")
     ABSORBER_EMITTER.print_summary()
     print(f"      absorber surface     : {system.absorber.name}")
     print(f"      emitter surface      : {system.emitter.name}")
