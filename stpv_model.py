@@ -1526,10 +1526,14 @@ class Sweeper:
 
     # ------------------------------------------------------------------ utils
     def _finish(self, fig: plt.Figure, filename: str) -> plt.Figure:
-        """Apply tight_layout, save the figure to disk, and report the path."""
+        """Apply tight_layout, save the figure to disk, and report the path.
+
+        Saves with bbox_inches="tight" so large poster-sized titles/labels
+        never get clipped at the figure edge, regardless of font size.
+        """
         fig.tight_layout()
         path = self.output_dir / filename
-        fig.savefig(path)
+        fig.savefig(path, bbox_inches="tight")
         print(f"  [plot] saved {path.name}")
         return fig
 
@@ -1595,28 +1599,62 @@ class Sweeper:
             print(f"  [sweep] concentration: {n_fail}/{ns_vals.size} points "
                   f"have no equilibrium below {T_MAX:.0f} K (module would melt)")
 
-        fig, ax1 = plt.subplots()
+        # Poster-sized styling: large text and thick lines so the figure reads
+        # clearly when placed small on a printed poster.
+        lw = 4.5
+        fs_label = 22
+        fs_title = 20
+        fs_tick = 17
+        fs_legend = 15
+
+        fig, ax1 = plt.subplots(figsize=(11.0, 8.0))
         ax2 = ax1.twinx()
+        # twinx() axes draw as a separate layer strictly after ax1, so ax2's
+        # content (including the melting-point line) would otherwise always
+        # cover ax1's legend regardless of per-artist zorder.  Swap the draw
+        # order so ax1 (and its legend) renders on top, and hide ax1's
+        # background patch so ax2's lines still show through everywhere else.
+        ax1.set_zorder(ax2.get_zorder() + 1)
+        ax1.patch.set_visible(False)
         l1, = ax1.semilogx(ns_eff_vals, 100.0 * eta, color="tab:blue",
-                           label=r"$\eta_{STPV}$")
+                           lw=lw, label=r"$\eta_{STPV}$")
         l2, = ax2.semilogx(ns_eff_vals, t_eq, color="tab:red",
-                           label=r"$T_{eq}$")
-        ax2.axhline(T_MELT_W, color="tab:red", ls=":", lw=1.2)
-        ax2.text(ns_eff_vals[-1], T_MELT_W - 110, "tungsten melting point",
-                 color="tab:red", fontsize=9, ha="right")
-        ax1.set_xlabel(r"Effective delivered concentration $N_{s,eff}$ [suns]")
+                           lw=lw, label=r"$T_{eq}$")
+        ax2.axhline(T_MELT_W, color="tab:red", ls=":", lw=lw * 0.7)
+        ax2.text(ns_eff_vals[-1], T_MELT_W - 170, "tungsten melting point",
+                 color="tab:red", fontsize=fs_legend, ha="right")
+
+        # Vertical marker at the currently configured design point, labeled
+        # next to the line itself (like the melting-point label) rather than
+        # in the legend.
+        ns_eff_current = self.base.effective_concentration
+        ax1.axvline(ns_eff_current, color="tab:green", ls="--", lw=lw * 0.85)
+        ax1.text(ns_eff_current * 1.08, 0.78,
+                 f"Current design\n($N_{{s,eff}}$ = {ns_eff_current:,.0f} suns)",
+                 transform=ax1.get_xaxis_transform(), color="tab:green",
+                 fontsize=fs_legend, ha="left", va="top")
+
+        ax1.set_xlabel(r"Effective delivered concentration $N_{s,eff}$ [suns]",
+                       fontsize=fs_label)
         ax1.set_ylabel(r"Overall efficiency $\eta_{STPV}$ [%]",
-                       color="tab:blue")
+                       color="tab:blue", fontsize=fs_label)
         ax2.set_ylabel(r"Equilibrium temperature $T_{eq}$ [K]",
-                       color="tab:red")
+                       color="tab:red", fontsize=fs_label)
+        ax1.tick_params(axis="both", labelsize=fs_tick)
         ax1.tick_params(axis="y", labelcolor="tab:blue")
-        ax2.tick_params(axis="y", labelcolor="tab:red")
+        ax2.tick_params(axis="y", labelsize=fs_tick, labelcolor="tab:red")
         ax2.grid(False)
-        ax1.set_title(r"Concentration sweep: $\eta_{STPV}$ and $T_{eq}$ vs "
-                      r"$N_{s,eff}$"
-                      f" ($\\beta$ = {self.base.beta:g}, concentrator eff = "
-                      f"{self.base.concentrator_efficiency:.2f})")
-        ax1.legend(handles=[l1, l2], loc="upper left")
+        ax1.set_title(r"Concentration sweep: $\eta_{STPV}$ and $T_{eq}$ vs $N_{s,eff}$"
+                      "\n"
+                      f"($\\beta$ = {self.base.beta:g}, concentrator eff = "
+                      f"{self.base.concentrator_efficiency:.2f})",
+                      fontsize=fs_title)
+        legend = ax1.legend(handles=[l1, l2], loc="upper left",
+                            fontsize=fs_legend, facecolor="white", framealpha=1.0)
+        # ax2 (twinx) draws above ax1 by default, so the melting-point line
+        # would otherwise render on top of ax1's legend; force the legend
+        # in front with an opaque background.
+        legend.set_zorder(10)
         return self._finish(fig, "fig2_concentration_sweep.png")
 
     # --------------------------------------------------- 3. area-ratio sweep
