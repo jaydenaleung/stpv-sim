@@ -1,0 +1,8 @@
+cff-version: 1.0.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: Leung
+    given-names: Jayden
+title: "Solar Thermophotovoltaic (STPV) Simulation"
+version: 1.3.0
+date-released: 2026-07-21
