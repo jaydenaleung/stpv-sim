@@ -1043,13 +1043,44 @@ _W_OSC: Tuple[Tuple[float, float, float], ...] = (
 )
 
 
-def refractive_index_tungsten(lam: np.ndarray) -> np.ndarray:
+# Electrical resistivity of tungsten vs temperature [K, 1e-8 Ohm m], from the
+# recommended values of Desai et al., J. Phys. Chem. Ref. Data 13, 1069 (1984).
+# The Drude damping grows with the DC resistivity, which is what makes a hot
+# metal a far better thermal emitter than a cold one.
+_W_RHO_T: np.ndarray = np.array(
+    [300.0, 500.0, 800.0, 1000.0, 1200.0, 1500.0, 1800.0,
+     2000.0, 2200.0, 2500.0, 2800.0, 3000.0, 3400.0])
+_W_RHO: np.ndarray = np.array(
+    [5.44, 10.3, 18.6, 24.9, 31.5, 42.4, 54.0,
+     62.0, 70.4, 83.2, 97.0, 106.0, 125.0])
+# The optical damping rises more slowly than the DC resistivity, since not every
+# DC scattering channel contributes at infrared frequencies.  This exponent is
+# calibrated against measured total hemispherical emissivity of tungsten
+# (0.11 at 1000 K, 0.19 at 1500 K, 0.26 at 2000 K, 0.33 at 2800 K), which it
+# reproduces to within ~6%.
+_W_DAMPING_EXPONENT: float = 0.80
+
+
+def tungsten_damping_ratio(temperature: float) -> float:
+    """Drude damping of tungsten at `temperature` [K] relative to its 300 K value."""
+    rho = float(np.interp(float(temperature), _W_RHO_T, _W_RHO))
+    return (rho / _W_RHO[0]) ** _W_DAMPING_EXPONENT
+
+
+def refractive_index_tungsten(lam: np.ndarray,
+                              temperature: float = 300.0) -> np.ndarray:
     """Complex refractive index n + ik of tungsten (Lorentz-Drude model).
 
     Parameters
     ----------
     lam : np.ndarray
         Vacuum wavelength [m].
+    temperature : float
+        Metal temperature [K].  The Drude damping is scaled from the measured
+        resistivity, which reproduces the strong rise of tungsten's thermal
+        emissivity with temperature (total hemispherical emissivity ~0.11 at
+        1000 K rising to ~0.33 at 2800 K).  The interband Lorentz oscillators
+        are left at their room-temperature values.
 
     Returns
     -------
@@ -1057,8 +1088,9 @@ def refractive_index_tungsten(lam: np.ndarray) -> np.ndarray:
         Complex refractive index (Im >= 0, passive medium).
     """
     w = H * C / (Q * np.asarray(lam, dtype=float))  # photon energy [eV]
+    gamma0 = _W_G0 * tungsten_damping_ratio(temperature)
     eps = np.full_like(w, 1.0, dtype=complex)
-    eps -= _W_F0 * _W_WP**2 / (w**2 + 1j * _W_G0 * w)          # Drude
+    eps -= _W_F0 * _W_WP**2 / (w**2 + 1j * gamma0 * w)         # Drude
     for f_j, g_j, w_j in _W_OSC:                                # Lorentz
         eps += f_j * _W_WP**2 / ((w_j**2 - w**2) - 1j * g_j * w)
     # Principal sqrt keeps Im(n) >= 0 because Im(eps) > 0 for a passive metal.
@@ -1077,13 +1109,17 @@ _SIC_WLO: float = 973.0
 _SIC_GAMMA: float = 4.76
 
 
-def refractive_index_sic(lam: np.ndarray) -> np.ndarray:
+def refractive_index_sic(lam: np.ndarray,
+                         temperature: float = 300.0) -> np.ndarray:
     """Complex refractive index n + ik of 6H-SiC (Lorentz reststrahlen model).
 
     Parameters
     ----------
     lam : np.ndarray
         Vacuum wavelength [m].
+    temperature : float
+        Accepted for interface consistency; the phonon parameters used here are
+        treated as temperature-independent.
 
     Returns
     -------
@@ -1105,21 +1141,25 @@ def refractive_index_sic(lam: np.ndarray) -> np.ndarray:
     return np.sqrt(eps.astype(complex))
 
 
-def _constant_index(n: float) -> Callable[[np.ndarray], np.ndarray]:
+def _constant_index(n: float) -> Callable[..., np.ndarray]:
     """Return a dispersion-free refractive-index function n(lam) = n + 0i."""
-    def index(lam: np.ndarray) -> np.ndarray:
+    def index(lam: np.ndarray, temperature: float = 300.0) -> np.ndarray:
         return np.full(np.shape(lam), complex(n))
     return index
 
 
-#: Registry of material dispersion functions, lam [m] -> complex index.
-REFRACTIVE_INDEX: Dict[str, Callable[[np.ndarray], np.ndarray]] = {
+#: Registry of material dispersion functions, (lam [m], T [K]) -> complex index.
+REFRACTIVE_INDEX: Dict[str, Callable[..., np.ndarray]] = {
     "Air": _constant_index(1.00),
     "W": refractive_index_tungsten,
     "SiC": refractive_index_sic,
     "HfO2": _constant_index(1.90),
     "SiO2": _constant_index(1.45),
 }
+
+#: Materials whose optical constants vary appreciably over the operating
+#: temperature range; stacks containing one are tabulated on a temperature grid.
+TEMPERATURE_DEPENDENT_MATERIALS: frozenset = frozenset({"W"})
 
 
 @dataclass(frozen=True)
@@ -1145,11 +1185,17 @@ class LayerStack:
 # ============================================================================
 
 class Emissivity:
-    """Interface: angle-averaged spectral emissivity/absorptivity models."""
+    """Interface: angle-averaged spectral emissivity/absorptivity models.
+
+    Both accessors take the surface temperature, since the optical constants of
+    real metals vary appreciably over an STPV operating range; models with
+    temperature-independent properties simply ignore it.
+    """
 
     name: str = "emissivity"
 
-    def hemispherical(self, lam: np.ndarray) -> np.ndarray:
+    def hemispherical(self, lam: np.ndarray,
+                      temperature: float = 300.0) -> np.ndarray:
         """Hemispherically averaged spectral emissivity eps_bar(lam).
 
         Defined as 2 int_0^{pi/2} eps(lam, t) sin(t)cos(t) dt, i.e. the
@@ -1157,7 +1203,8 @@ class Emissivity:
         """
         raise NotImplementedError
 
-    def cone_average(self, lam: np.ndarray, theta_c: float) -> np.ndarray:
+    def cone_average(self, lam: np.ndarray, theta_c: float,
+                     temperature: float = 300.0) -> np.ndarray:
         """Spectral emissivity averaged over a cone of half-angle theta_c.
 
         Defined as [2 int_0^{theta_c} eps sin cos dt] / sin^2(theta_c), so a
@@ -1167,19 +1214,21 @@ class Emissivity:
 
 
 class AnalyticEmissivity(Emissivity):
-    """Angle-independent emissivity given by an arbitrary function of lam."""
+    """Angle- and temperature-independent emissivity, an arbitrary eps(lam)."""
 
     def __init__(self, fn: Callable[[np.ndarray], np.ndarray], name: str) -> None:
         self._fn = fn
         self.name = name
 
-    def hemispherical(self, lam: np.ndarray) -> np.ndarray:
+    def hemispherical(self, lam: np.ndarray,
+                      temperature: float = 300.0) -> np.ndarray:
         """See base class; angle-independent, so simply eps(lam)."""
         return np.asarray(self._fn(np.asarray(lam)), dtype=float)
 
-    def cone_average(self, lam: np.ndarray, theta_c: float) -> np.ndarray:
+    def cone_average(self, lam: np.ndarray, theta_c: float,
+                     temperature: float = 300.0) -> np.ndarray:
         """See base class; angle-independent, so simply eps(lam)."""
-        return self.hemispherical(lam)
+        return self.hemispherical(lam, temperature)
 
 
 def gray_emissivity(eps: float, name: Optional[str] = None) -> AnalyticEmissivity:
@@ -1227,16 +1276,27 @@ class TMMEmissivity(Emissivity):
     wavelength grid and a uniform grid in u = sin^2(theta).  Angular
     integrals with the radiative weight sin(t)cos(t) dt = du/2 then reduce to
     cumulative-trapezoid lookups, so all downstream power integrals are
-    vectorized and the expensive TMM sweep runs exactly once per stack.
+    vectorized and the expensive TMM sweep runs once per stack.
+
+    Stacks containing a material from TEMPERATURE_DEPENDENT_MATERIALS are
+    tabulated on a grid of temperatures and linearly interpolated in T, so the
+    growth of metallic emissivity with temperature is carried through the power
+    integrals; all other stacks use a single temperature-independent table.
     """
+
+    #: Temperatures [K] at which temperature-dependent stacks are tabulated.
+    TEMPERATURE_GRID: np.ndarray = np.array(
+        [300.0, 900.0, 1500.0, 2100.0, 2700.0, 3500.0])
 
     def __init__(self, stack: LayerStack,
                  lam_grid: Optional[np.ndarray] = None,
-                 n_angles: int = 33,
+                 n_angles: int = 25,
                  verbose: bool = True) -> None:
         self.stack = stack
         self.name = stack.name
-        self._lam = (np.geomspace(2.0e-7, 5.0e-5, 192)
+        # Spans 0.1-200 um so that essentially all of the Planck spectrum is
+        # covered from 250 K up to the refractory melting points.
+        self._lam = (np.geomspace(1.0e-7, 2.0e-4, 220)
                      if lam_grid is None else np.asarray(lam_grid, dtype=float))
         self._u = np.linspace(0.0, 1.0, n_angles)
         # Avoid exactly-grazing incidence (numerically singular Fresnel case);
@@ -1245,37 +1305,60 @@ class TMMEmissivity(Emissivity):
 
         d_list: List[float] = [np.inf] + [d for _, d in stack.coatings] + [np.inf]
         materials = ["Air"] + [m for m, _ in stack.coatings] + [stack.substrate]
-        n_table = np.column_stack(
-            [REFRACTIVE_INDEX[m](self._lam) for m in materials])
+        varies = any(mat in TEMPERATURE_DEPENDENT_MATERIALS for mat in materials)
+        self._temps = self.TEMPERATURE_GRID if varies else np.array([300.0])
 
         if verbose:
             print(f"  [TMM] computing eps(lam, theta) for '{stack.name}' "
-                  f"({self._lam.size} wavelengths x {n_angles} angles x 2 pol)...")
+                  f"({self._lam.size} wavelengths x {n_angles} angles x 2 pol"
+                  + (f" x {self._temps.size} temperatures" if varies else "")
+                  + ")...")
         t0 = time.perf_counter()
-        eps = np.empty((self._lam.size, self._u.size))
-        for i, lam_i in enumerate(self._lam):
-            n_list = list(n_table[i])
-            for j, th in enumerate(thetas):
-                r_s = tmm.coh_tmm("s", n_list, d_list, th, lam_i)["R"]
-                r_p = tmm.coh_tmm("p", n_list, d_list, th, lam_i)["R"]
-                eps[i, j] = 1.0 - 0.5 * (r_s + r_p)
+        eps = np.empty((self._temps.size, self._lam.size, self._u.size))
+        for t_idx, temp in enumerate(self._temps):
+            n_table = np.column_stack(
+                [REFRACTIVE_INDEX[mat](self._lam, temp) for mat in materials])
+            for i, lam_i in enumerate(self._lam):
+                n_list = list(n_table[i])
+                for j, th in enumerate(thetas):
+                    r_s = tmm.coh_tmm("s", n_list, d_list, th, lam_i)["R"]
+                    r_p = tmm.coh_tmm("p", n_list, d_list, th, lam_i)["R"]
+                    eps[t_idx, i, j] = 1.0 - 0.5 * (r_s + r_p)
         if verbose:
             print(f"  [TMM] done in {time.perf_counter() - t0:.1f} s")
 
-        # Cumulative integral over u, per wavelength: C(lam, u) = int_0^u eps du'
+        # Cumulative integral over u, per (temperature, wavelength):
+        # C(T, lam, u) = int_0^u eps du'
         self._eps = eps
-        self._cum = cumulative_trapezoid(eps, self._u, axis=1, initial=0.0)
-        self._hemi = self._cum[:, -1]           # int_0^1 eps du
+        self._cum = cumulative_trapezoid(eps, self._u, axis=2, initial=0.0)
+        self._hemi = self._cum[:, :, -1]        # int_0^1 eps du
 
-    def hemispherical(self, lam: np.ndarray) -> np.ndarray:
+    def _blend(self, table: np.ndarray, temperature: float) -> np.ndarray:
+        """Linearly interpolate a tabulated quantity to `temperature` [K]."""
+        if self._temps.size == 1:
+            return table[0]
+        t = float(np.clip(temperature, self._temps[0], self._temps[-1]))
+        hi = int(np.searchsorted(self._temps, t).clip(1, self._temps.size - 1))
+        lo = hi - 1
+        span = self._temps[hi] - self._temps[lo]
+        f = (t - self._temps[lo]) / span
+        return table[lo] * (1.0 - f) + table[hi] * f
+
+    def hemispherical(self, lam: np.ndarray,
+                      temperature: float = 300.0) -> np.ndarray:
         """See base class (values clamped outside the internal TMM grid)."""
-        return np.interp(np.asarray(lam), self._lam, self._hemi)
+        return np.interp(np.asarray(lam), self._lam,
+                         self._blend(self._hemi, temperature))
 
-    def cone_average(self, lam: np.ndarray, theta_c: float) -> np.ndarray:
+    def cone_average(self, lam: np.ndarray, theta_c: float,
+                     temperature: float = 300.0) -> np.ndarray:
         """See base class (values clamped outside the internal TMM grid)."""
         u_c = float(np.clip(np.sin(theta_c) ** 2, 1e-12, 1.0))
-        cum_at_uc = np.array(
-            [np.interp(u_c, self._u, row) for row in self._cum])
+        cum = self._blend(self._cum, temperature)
+        hi = int(np.searchsorted(self._u, u_c).clip(1, self._u.size - 1))
+        lo = hi - 1
+        f = (u_c - self._u[lo]) / (self._u[hi] - self._u[lo])
+        cum_at_uc = cum[:, lo] * (1.0 - f) + cum[:, hi] * f
         return np.interp(np.asarray(lam), self._lam, cum_at_uc / u_c)
 
 
@@ -1354,29 +1437,31 @@ class STPVSystem:
         else:
             self.theta_c_eff = float(
                 np.arcsin(min(1.0, np.sqrt(self.concentration) * np.sin(THETA_SUN))))
-        # Precomputed spectral tables on the master wavelength grid.
         self._lam: np.ndarray = lam
-        self._eps_abs_hemi: np.ndarray = self.absorber.hemispherical(lam)
-        self._eps_emit_hemi: np.ndarray = self.emitter.hemispherical(lam)
+        self._am15: np.ndarray = am15_spectral_irradiance(lam)
         # Cold-side filter transmittance (all ones if no/disabled filter); the
         # emitter's effective emissivity toward the cell is weighted by it.
         self._filter_tau: np.ndarray = (
             self.optical_filter.spectral_transmittance(lam)
             if self.optical_filter is not None else np.ones_like(lam))
-        self._eps_emit_cold: np.ndarray = self._eps_emit_hemi * self._filter_tau
-        eps_abs_cone = self.absorber.cone_average(lam, self.theta_c_eff)
-        self._p_sol: float = self.concentrator_efficiency * self.concentration \
-            * float(simpson(eps_abs_cone * am15_spectral_irradiance(lam), x=lam))
 
     # ------------------------------------------------------------------ power
-    def p_sol(self) -> float:
-        """Absorbed concentrated solar power P_sol [W/m^2] (T-independent)."""
-        return self._p_sol
+    def p_sol(self, temperature: float = 300.0) -> float:
+        """Concentrated solar power absorbed by the absorber at T [W/m^2].
+
+        Depends on temperature only through the absorber's optical constants;
+        for temperature-independent surfaces it is constant.
+        """
+        eps_cone = self.absorber.cone_average(self._lam, self.theta_c_eff,
+                                              temperature)
+        return self.concentrator_efficiency * self.concentration * float(
+            simpson(eps_cone * self._am15, x=self._lam))
 
     def p_abs(self, temperature: float) -> float:
         """Power re-radiated by the absorber front face at T [W/m^2]."""
         radiance = planck_spectral_radiance(self._lam, temperature)
-        return np.pi * float(simpson(self._eps_abs_hemi * radiance, x=self._lam))
+        eps = self.absorber.hemispherical(self._lam, temperature)
+        return np.pi * float(simpson(eps * radiance, x=self._lam))
 
     def p_emit(self, temperature: float) -> float:
         """Net power radiated by the emitter toward the PV at T [W/m^2 emitter].
@@ -1386,7 +1471,13 @@ class STPVSystem:
         radiative loss.  With no filter this is the full hemispherical emission.
         """
         radiance = planck_spectral_radiance(self._lam, temperature)
-        return np.pi * float(simpson(self._eps_emit_cold * radiance, x=self._lam))
+        return np.pi * float(simpson(self._eps_emit_cold(temperature) * radiance,
+                                     x=self._lam))
+
+    def _eps_emit_cold(self, temperature: float) -> np.ndarray:
+        """Emitter emissivity toward the cell at T, weighted by the filter."""
+        return self.emitter.hemispherical(self._lam, temperature) \
+            * self._filter_tau
 
     def net_power(self, temperature: float) -> float:
         """Net heating power P_sol - P_abs(T) - beta * P_emit(T) [W/m^2].
@@ -1394,7 +1485,7 @@ class STPVSystem:
         Positive => the module heats up; negative => it cools down; the root
         is the thermal-equilibrium operating temperature.
         """
-        return (self._p_sol - self.p_abs(temperature)
+        return (self.p_sol(temperature) - self.p_abs(temperature)
                 - self.beta * self.p_emit(temperature))
 
     # ------------------------------------------------------------ equilibrium
@@ -1438,7 +1529,7 @@ class STPVSystem:
             lam <= lam_g (also weighted by the filter transmittance).
         """
         lam = self._lam
-        spectral_power = np.pi * self._eps_emit_cold \
+        spectral_power = np.pi * self._eps_emit_cold(temperature) \
             * planck_spectral_radiance(lam, temperature)
         total = float(simpson(spectral_power, x=lam))
         in_band = np.where(lam <= lam_g, spectral_power * lam / (H * C), 0.0)
@@ -1482,7 +1573,7 @@ class STPVSystem:
         Returns a dict with the power terms, the five PV factors
         (SE, IQE, VF, FF, CE), eta_int, eta_pvc, and eta_stpv.
         """
-        p_sol = self._p_sol
+        p_sol = self.p_sol(temperature)
         p_abs = self.p_abs(temperature)
         p_emit = self.p_emit(temperature)
         eta_int = 1.0 - p_abs / p_sol if p_sol > 0.0 else 0.0
@@ -1544,7 +1635,7 @@ class Sweeper:
     def plot_equilibrium(self) -> plt.Figure:
         """Net power vs temperature, visually proving the brentq root."""
         temps = np.linspace(300.0, T_MAX, 161)
-        p_sol = self.base.p_sol()
+        p_sol = np.array([self.base.p_sol(t) for t in temps])
         losses = np.array(
             [self.base.p_abs(t) + self.base.beta * self.base.p_emit(t)
              for t in temps])
@@ -1554,7 +1645,7 @@ class Sweeper:
         fig, ax = plt.subplots()
         ax.plot(temps, net / 1e3, color="tab:blue",
                 label=r"Net power $P_{sol} - P_{abs} - \beta P_{emit}$")
-        ax.plot(temps, np.full_like(temps, p_sol) / 1e3, "--",
+        ax.plot(temps, p_sol / 1e3, "--",
                 color="tab:orange", lw=1.4, label=r"$P_{sol}$ (input)")
         ax.plot(temps, losses / 1e3, "--", color="tab:red", lw=1.4,
                 label=r"$P_{abs} + \beta P_{emit}$ (radiative losses)")
@@ -1698,8 +1789,13 @@ class Sweeper:
 
     # ------------------------------------------------------ 5. bandgap sweep
     def plot_bandgap_sweep(self) -> plt.Figure:
-        """PV bandgap 0.5-2.0 eV vs eta_STPV: blackbody vs narrowband emitter."""
-        bandgaps = np.linspace(0.5, 2.0, 61)
+        """PV bandgap vs eta_STPV: blackbody vs narrowband emitter.
+
+        Swept from 0.2 eV so the range brackets the thermophotovoltaic optimum,
+        which sits near E_g ~ 2.2-2.9 k T_emit and therefore falls well below
+        1 eV at realistic cavity temperatures.
+        """
+        bandgaps = np.linspace(0.2, 2.0, 73)
         emitters: Sequence[Emissivity] = (
             gray_emissivity(1.0, "Idealized blackbody emitter"),
             step_band_emissivity(
@@ -1775,7 +1871,7 @@ def run_validation() -> None:
           f"vs sigma*T^4 = {exact:.4g} (err {err:.1e})")
 
     # 2: solar normalization.
-    p_sol = system.p_sol()
+    p_sol = system.p_sol(1500.0)
     err = abs(p_sol / (100.0 * ONE_SUN) - 1.0)
     assert err < 1e-2, f"AM1.5 normalization error {err:.2e}"
     print(f"  [ok] perfect-absorber P_sol(100 suns) = {p_sol:.4g} W/m^2 "

@@ -46,6 +46,56 @@ python stpv_model.py
 
 This runs a set of internal validation checks (verifying the numerical integrals against known closed-form results), prints the configured system and its computed operating point, and generates/saves the five sweep plots as PNGs in the project directory.
 
+## Validation
+
+The model has been validated against closed-form physics, published analytical results, and two experimental/simulation studies from the STPV literature:
+
+- **[A]** M. A. Abbas et al., "Nanostructured chromium-based broadband absorbers and emitters to realize thermally stable solar thermophotovoltaic systems," *Nanoscale* **14**, 6425 (2022) — the source of the power-balance formulation in `THEORY.md`.
+- **[R]** V. D. Rumyantsev et al., "Structural Features of a Solar TPV System," *6th Conf. on Thermophotovoltaic Generation of Electricity* (2004) — an experimental two-stage-concentrator STPV system.
+
+### Closed-form and internal consistency
+
+| Check | Agreement |
+|---|---|
+| Blackbody `P_emit` vs. Stefan–Boltzmann σT⁴ (500–3400 K) | ≤ 0.11% |
+| Planck peak vs. Wien displacement law | ≤ 0.014% |
+| AM1.5 total irradiance | 1000 W/m² by construction |
+| Max Si photocurrent from AM1.5 | 43.1 mA/cm² (literature 43–46) |
+| Angular averaging normalisation (hemispherical and cone) | exact |
+| Wavelength-grid convergence vs. a 20× finer grid | 0.00% (smooth), 0.35% (step band edges) |
+| Thermodynamic limits (η_int ≤ 1, VF ≤ 1, η_STPV ≤ Carnot) | no violations across N_s = 10–10⁴, β = 0.5–5 |
+
+### Against paper [A]
+
+| Check | Agreement |
+|---|---|
+| Analytical intermediate efficiency, η_int = 1 − πT⁴/(N_sΩ_sT_s⁴) (their eqn. 9) | ≤ 0.005% at four (T, N_s) points |
+| Incidence cone angle θ_c = asin√(N_sΩ_s/π) vs. the model's étendue relation | 0.39% |
+| Reported Cr-absorber η_int at 873/1573/1673 K and 500–40 000 suns (their Fig. 2d) | ≤ 3.4% |
+| Area-ratio identity η_int = β/(1+β) for a symmetric cavity | exact |
+| **End-to-end system efficiency** at 1573 K, 3000 suns, β = 2.25, E_g = 0.54 eV | **model 20.5% vs. paper 21%** |
+
+### Against paper [R]
+
+| Check | Result |
+|---|---|
+| GaSb photocurrent from a blackbody emitter at 2200 K | 58.6 A/cm² (paper: > 40 A/cm² for equal areas) |
+| Emitter-to-absorber area ratio β = 5–10 reduces re-radiation loss | η_int rises 50% → 90.9% as β goes 1 → 10 |
+| Tungsten emitter blue-shifts emission vs. a grey body (their Fig. 10) | reproduced; above-bandgap fraction 77.7% vs. 37.2% |
+| Photon recycling from the cell's back-surface reflector (return efficiency 90%) | at their β = 10 geometry, η_STPV 25.1% → 27.5% with T_eq rising 2539 → 2582 K |
+| Two-stage dish + CPC, 0.45 m² primary at 8000× | reproduced exactly from geometry |
+
+### Material data
+
+Tungsten optical constants use a Lorentz–Drude model with temperature-dependent Drude damping scaled from measured resistivity. Room-temperature reflectance matches handbook values within 1–8% over 0.5–10 µm, and total hemispherical emissivity matches handbook values within 6% from 1000 K to 2800 K. Silicon carbide reproduces the 10.3–12.6 µm reststrahlen band.
+
+### Known limitations
+
+- **Spectral efficiency convention.** `SE` normalises above-bandgap power by the *total* emitted power, so sub-bandgap emission is charged as a loss. Paper [A]'s `U_eff` normalises only by above-bandgap power. The two agree at high temperature (hence the 20.5%/21% match at 1573 K) but diverge sharply when most emission is sub-bandgap — at 873 K the model gives ~5% where [A] reports 15%. Since [A] explicitly ignores photon recycling, the model's convention is the conservative one.
+- **Silicon carbide emissivity** uses the opaque `ε = 1 − R` assumption, which is rigorous inside the reststrahlen band but overestimates emittance in SiC's transparent near-infrared window.
+- **Dark current is held fixed** across the bandgap sweep, whereas detailed balance gives J₀ ∝ exp(−E_g/kT_c). Testing shows this barely moves the optimum bandgap, but it does inflate efficiency at low E_g.
+- Radiative transfer only — no conduction or convection, and the absorber/emitter is treated as isothermal.
+
 ## Project structure
 
 | Path | Contents |
