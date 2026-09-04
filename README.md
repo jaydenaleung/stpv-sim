@@ -2,6 +2,8 @@
 
 A numerical Python model of a Solar Thermophotovoltaic (STPV) energy conversion system — from concentrated sunlight, through a thermally-equilibrated absorber/emitter cavity, to a photovoltaic cell.
 
+This simulation was designed for a research project at the Secondary Student Training Program by the Belin-Blank Center, University of Iowa. You can view the full research poster [here](https://drive.google.com/file/d/1Hyl38rfJYm-bjaMDOagI03IL1U8eMvh3/view?usp=drivesdk).
+
 ## What is STPV?
 
 A Solar Thermophotovoltaic system concentrates sunlight onto an absorber, which heats up and re-radiates that energy as thermal (infrared/near-infrared) light. An emitter — often the same physical part as the absorber, or a separate surface radiatively coupled to it — shapes that thermal spectrum and sends it to a photovoltaic cell tuned to harvest it. The appeal is that a well-designed selective absorber/emitter pair can reshape broadband sunlight into a narrower spectral band matched to the PV cell's bandgap, in principle enabling higher conversion efficiencies than direct photovoltaics, and can keep producing power for a while after the sun goes behind a cloud (thermal storage) since the cavity stays hot.
